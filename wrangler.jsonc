@@ -1,0 +1,8 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "burgerbaz-menu",
+  "compatibility_date": "2026-09-17",
+  "pages_build_output_dir": "./dist",
+  "d1_databases": [{"binding":"DB","database_name":"burgerbaz-menu","database_id":"00000000-0000-0000-0000-000000000001","migrations_dir":"migrations"}],
+  "r2_buckets": [{"binding":"MEDIA","bucket_name":"burgerbaz-media"}]
+}

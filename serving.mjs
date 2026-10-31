@@ -1,0 +1,45 @@
+import {chromium,expect} from '@playwright/test';
+import assert from 'node:assert/strict';
+import {readFileSync,writeFileSync,mkdirSync} from 'node:fs';
+const base='http://localhost:3000';
+const auth=JSON.parse(readFileSync('artifacts/test-auth.json','utf8'));
+mkdirSync('artifacts',{recursive:true});
+const browser=await chromium.launch({headless:true,args:['--no-sandbox']});
+const page=await browser.newPage({viewport:{width:1440,height:1000}});
+const publicPage=await browser.newPage({viewport:{width:390,height:844}});
+const errors=[];page.on('pageerror',e=>errors.push(e.message));publicPage.on('pageerror',e=>errors.push(e.message));
+let csrf='',id='',settingsBackup,passed=0;
+const ok=s=>console.log('PASS',++passed,s);
+async function api(path,method='GET',body,status=200){const r=await page.request.fetch(base+'/api/admin/'+path,{method,headers:{Origin:base,'X-CSRF-Token':csrf},...(body===undefined?{}:{data:body})});const d=await r.json();assert.equal(r.status(),status,JSON.stringify(d));return d}
+const content=()=>api('content');
+const pub=async()=>await(await publicPage.request.get(base+'/api/menu')).json();
+async function item(){return (await content()).items.find(i=>i.id===id)}
+async function save(p,action='publish',status=200){return api('content/items/'+p.id,'PUT',{data:p,version:p.version,action},status)}
+try{
+ await page.goto(base+'/admin/login');await page.locator('[name=email]').fill(auth.email);await page.locator('[name=password]').fill(auth.password);await page.locator('#login-form button').click();await expect(page.locator('.stats-grid')).toBeVisible();csrf=(await api('me')).csrf;
+ await page.locator('[data-view=items]').click();await page.locator('[data-create=items]').click();
+ await expect(page.locator('.serving-editor-row')).toHaveCount(3);ok('Three exact serving models are editable in admin');
+ await page.locator('[name=name]').fill('آزمایش روش سرو');await page.locator('[name=slug]').fill('serving-test');await page.locator('[name=price]').fill('۹۹۹');
+ const types=['plain','mixed-cheese','mushroom-cheese'];const labels=['ساده','میکس پنیر','قارچ و پنیر'];const prices=['۱۲۰٬۰۰۰','۱۵۰٬۰۰۰','۱۸۰٬۰۰۰'];
+ for(let i=0;i<3;i++){await page.locator(`[name="serve-enabled-${types[i]}"]`).check();await page.locator(`[name="serve-price-${types[i]}"]`).fill(prices[i])}
+ await expect(page.locator('[data-base-price-field]')).toBeHidden();await page.locator('#preview-item').click();await expect(page.locator('.serving-preview-list li')).toHaveCount(3);await page.locator('[data-close-preview]').click();await page.screenshot({path:'artifacts/serving-admin.png'});ok('Independent Persian prices and live form preview; single price suppressed');
+ await page.locator('#content-form [value=draft]').click();await expect(page.locator('#editor-dialog')).toBeHidden();let p=(await content()).items.find(x=>x.slug==='serving-test');id=p.id;assert.deepEqual(p.servingOptions.map(o=>o.price),[120000,150000,180000]);assert(!(await pub()).items.some(x=>x.id===id));ok('Draft prices persist without public disclosure');
+ await page.reload();await page.locator('#admin-search').fill('آزمایش روش سرو');await page.locator('[data-edit]').click();for(let i=0;i<3;i++){await expect(page.locator(`[name="serve-enabled-${types[i]}"]`)).toBeChecked();await expect(page.locator(`[name="serve-price-${types[i]}"]`)).toHaveValue(String([120000,150000,180000][i]))}
+ await page.locator('#content-form [value=publish]').click();await expect(page.locator('#editor-dialog')).toBeHidden();let published=(await pub()).items.find(x=>x.id===id);assert.deepEqual(published.servingOptions.map(o=>o.name),labels);ok('All three prices survive reload and publish accurately');
+ await publicPage.goto(base,{waitUntil:'networkidle'});const card=publicPage.locator('.food-card').filter({has:publicPage.locator('[data-item="'+id+'"]')});await card.scrollIntoViewIfNeeded();for(let i=0;i<3;i++){await card.locator('.serving-choice').filter({hasText:labels[i]}).click();await expect(card.locator('[data-serving-price]')).toContainText(Number([120000,150000,180000][i]).toLocaleString('fa-IR'))}await expect(publicPage.locator('#item-dialog')).toBeHidden();assert(await publicPage.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await card.screenshot({path:'artifacts/serving-card.png'});ok('Mobile card selection updates matching price without opening details or purchasing');
+ await card.locator('[data-item]').click();const dlg=publicPage.locator('#item-dialog');await expect(dlg.locator('[data-serving-option]')).toHaveCount(3);await dlg.locator('.serving-choice').filter({hasText:'قارچ و پنیر'}).click();await expect(dlg.locator('[data-serving-price]')).toContainText('۱۸۰٬۰۰۰');await dlg.locator('input[value=plain]').focus();await publicPage.keyboard.press('ArrowRight');const selected=await dlg.locator('input:checked').getAttribute('data-price');await expect(dlg.locator('[data-serving-price]')).toContainText(Number(selected).toLocaleString('fa-IR'));await publicPage.screenshot({path:'artifacts/serving-mobile.png'});await publicPage.keyboard.press('Escape');ok('Read-only modal selection, keyboard radio navigation, and Escape work');
+ await publicPage.goto(base+'/item/serving-test');await expect(publicPage.locator('[data-serving-option]')).toHaveCount(3);await publicPage.locator('.serving-choice').filter({hasText:'میکس پنیر'}).click();await expect(publicPage.locator('[data-serving-price]')).toContainText('۱۵۰٬۰۰۰');ok('Direct SSR item page supports serving selection');
+ p=await item();p.servingOptions[1].price=333333;await save(p,'draft');assert.equal((await pub()).items.find(x=>x.id===id).servingOptions[1].price,150000);await page.goto(base+'/admin/preview');await page.locator('[data-item="'+id+'"]').click();await page.locator('#item-dialog .serving-choice').filter({hasText:'میکس پنیر'}).click();await expect(page.locator('#item-dialog [data-serving-price]')).toContainText('۳۳۳٬۳۳۳');ok('Private draft preview and public snapshot retain separate prices');
+ p=await item();p.servingOptions[1].enabled=false;p.servingOptions[2].price=null;await save(p);published=(await pub()).items.find(x=>x.id===id);assert.equal(published.servingOptions.length,2);assert(!JSON.stringify(published).includes('333333'));await publicPage.reload();await expect(publicPage.locator('[data-serving-option]')).toHaveCount(2);await publicPage.locator('.serving-choice').filter({hasText:'قارچ و پنیر'}).click();await expect(publicPage.locator('[data-serving-price]')).toHaveText('قارچ و پنیر — قیمت درج نشده');ok('Disabled models are private; null prices do not fall back to another model');
+ settingsBackup=(await content()).settings;await api('content/settings/1','PUT',{data:{...settingsBackup,showPrices:false},version:settingsBackup.version,action:'publish'});published=(await pub()).items.find(x=>x.id===id);assert(published.servingOptions.every(o=>o.price===null));assert.equal(published.price,null);await publicPage.reload();await expect(publicPage.locator('[data-serving-price]')).toHaveCount(0);assert(!(await publicPage.content()).includes('120000'));ok('Global price visibility redacts nested option prices in API and HTML');
+ let settings=(await content()).settings;await api('content/settings/1','PUT',{data:settingsBackup,version:settings.version,action:'publish'});settingsBackup=null;
+ p=await item();for(const bad of [-1,1.5,'120000',1000000001]){let invalid=structuredClone(p);invalid.servingOptions[0].price=bad;await save(invalid,'publish',400)}let invalid=structuredClone(p);invalid.servingOptions[1].id='plain';await save(invalid,'publish',400);invalid=structuredClone(p);invalid.servingOptions[1].enabled='true';await save(invalid,'publish',400);ok('Server rejects negative, fractional, string, excessive, duplicate and mistyped values');
+ const legacy=structuredClone(p);delete legacy.servingOptions;await save(legacy);p=await item();assert.equal(p.servingOptions[0].price,120000);ok('Legacy API writes do not erase serving configuration');
+ p.servingOptions.forEach(o=>o.enabled=false);await save(p);await publicPage.reload();await expect(publicPage.locator('[data-serving-option]')).toHaveCount(0);await expect(publicPage.locator('.detail-copy .price')).toContainText('۹۹۹');assert.equal((await item()).servingOptions[0].price,120000);ok('Disabling every option restores preserved single price without losing option prices');
+ const anonymous=await publicPage.request.post(base+'/api/admin/content/items/'+id,{data:{},headers:{Origin:base}});assert.equal(anonymous.status(),401);assert.deepEqual(errors,[]);ok('Authorization retained and no browser script errors');
+}finally{
+ if(id){const p=await item();if(p)await api('content/items/'+id,'DELETE',{version:p.version})}
+ if(settingsBackup){const s=(await content()).settings;await api('content/settings/1','PUT',{data:settingsBackup,version:s.version,action:'publish'})}
+ await browser.close();
+}
+writeFileSync('artifacts/serving-results.json',JSON.stringify({passed,date:new Date().toISOString()},null,2));console.log(passed+' serving acceptance checks passed; sample item and prices removed.');

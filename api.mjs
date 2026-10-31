@@ -1,0 +1,49 @@
+import assert from 'node:assert/strict';
+import {readFileSync,writeFileSync,existsSync,mkdirSync} from 'node:fs';
+import {randomBytes} from 'node:crypto';
+const base=process.env.TEST_BASE_URL||'http://localhost:3000';
+if(!/^http:\/\/(localhost|127\.0\.0\.1):/.test(base))throw Error('These tests may modify data. Use an isolated local database only.');
+mkdirSync('artifacts',{recursive:true});
+const expected=JSON.parse(readFileSync('tests/seed-fixture.json','utf8'));
+let cookie='',csrf='',count=0;
+function ok(name){console.log('PASS',++count,name)}
+async function req(path,method='GET',body,options={}){const headers={Origin:base,...(options.auth===false?{}:{Cookie:cookie,'X-CSRF-Token':csrf}),...options.headers};if(body!==undefined&&!(body instanceof FormData))headers['Content-Type']='application/json';const r=await fetch(base+path,{method,headers,body:body instanceof FormData?body:body===undefined?undefined:JSON.stringify(body),redirect:'manual'});let data;const raw=await r.text();try{data=JSON.parse(raw)}catch{data=raw}return {r,data}}
+async function admin(path,method='GET',body,status=200){const result=await req('/api/admin/'+path,method,body);assert.equal(result.r.status,status,JSON.stringify(result.data));return result.data}
+const first=await req('/api/menu');assert.equal(first.r.status,200);assert.equal(first.data.categories.length,6);assert.equal(first.data.items.length,44);ok('6 categories and 44 products');
+for(const cat of expected.categories){assert.equal(first.data.items.filter(x=>x.categoryId===cat.id).length,expected.items.filter(x=>x.categoryId===cat.id).length)}ok('Exact category item counts 12 / 7 / 10 / 4 / 6 / 5');
+for(const item of expected.items){const current=first.data.items.find(x=>x.id===item.id);assert.equal(current.name,item.name);assert.equal(current.shortDescription,item.shortDescription);assert.equal(current.price,null)}ok('All supplied names and descriptions preserved; no invented prices');
+assert.deepEqual(first.data.categories.find(c=>c.id==='sandwiches').preparationLabels,['ساده','پنیر ترکیبی','سس قارچ']);ok('Three preparation labels retained');
+assert.equal((await req('/api/admin/content', 'GET',undefined,{auth:false})).r.status,401);assert.equal((await req('/admin')).r.status,302);assert.equal((await req('/admin/preview')).r.status,302);ok('Protected API, admin HTML and draft preview require authentication');
+const html=(await req('/')).data;assert(!/checkout|add-to-cart|shopping-cart|سبد خرید|ثبت سفارش|پرداخت آنلاین/.test(html));assert(html.includes('dir="rtl"'));ok('RTL public website without purchasing controls');
+const token=readFileSync('.dev.vars','utf8').match(/BOOTSTRAP_TOKEN=(.+)/)[1].trim();
+let credentials=existsSync('artifacts/test-auth.json')?JSON.parse(readFileSync('artifacts/test-auth.json','utf8')):{email:'qa-local@burgerbaz.test',password:randomBytes(24).toString('base64url')};
+if(!(await req('/admin/login')).data.includes('data-setup="false"')){const setup=await req('/api/auth/setup','POST',{...credentials,setupToken:token});assert.equal(setup.r.status,200,JSON.stringify(setup.data));writeFileSync('artifacts/test-auth.json',JSON.stringify(credentials),{mode:0o600});ok('One-time secure administrator setup')}
+const login=await req('/api/auth/login','POST',credentials);assert.equal(login.r.status,200,JSON.stringify(login.data));cookie=login.r.headers.get('set-cookie').split(';')[0];csrf=login.data.csrf;assert(login.r.headers.get('set-cookie').includes('HttpOnly'));assert(login.r.headers.get('set-cookie').includes('SameSite=Strict'));ok('Password authentication and HttpOnly SameSite session');
+assert.equal((await req('/api/auth/setup','POST',{...credentials,setupToken:token})).r.status,409);ok('Setup locked after first account');
+assert.equal((await req('/api/admin/logout','POST',{}, {headers:{'X-CSRF-Token':'invalid'}})).r.status,403);assert.equal((await req('/api/admin/logout','POST',{}, {headers:{Origin:'https://evil.example'}})).r.status,403);ok('CSRF and cross-origin write protection');
+const me=await admin('me');assert.equal(me.email,credentials.email);let content=await admin('content');assert.equal(content.items.length,44);assert(!JSON.stringify(first.data).includes('password_hash'));assert(!JSON.stringify(first.data).includes('csrf'));ok('Private dashboard data and public data separation');
+const suffix=Date.now();const category={name:'دسته آزمایشی',slug:'qa-'+suffix,description:'توضیح آزمایشی',imageUrl:'',sortOrder:90,preparationLabels:['ساده']};
+const c=await admin('content/categories','POST',{data:category,action:'draft'},201);assert(!(await req('/api/menu')).data.categories.some(x=>x.id===c.id));ok('Draft category creation is private');
+await admin('content/categories/'+c.id,'PUT',{data:category,action:'publish',version:1});
+const product={...expected.items[0],name:'آیتم آزمایشی',slug:'qa-item-'+suffix,categoryId:c.id,imageUrl:'',imageAlt:'',sortOrder:0};delete product.id;
+const p=await admin('content/items','POST',{data:product,action:'draft'},201);assert(!(await req('/api/menu')).data.items.some(x=>x.id===p.id));ok('Draft item creation is private');
+await admin('content/items/'+p.id,'PUT',{data:product,action:'publish',version:1});assert((await req('/api/menu')).data.items.some(x=>x.id===p.id));ok('Publish item appears on public menu');
+const draft={...product,name:'نام پیش‌نویس',price:123456};await admin('content/items/'+p.id,'PUT',{data:draft,action:'draft',version:2});assert.equal((await req('/api/menu')).data.items.find(x=>x.id===p.id).name,product.name);assert.equal((await req('/api/menu')).data.items.find(x=>x.id===p.id).price,null);ok('Draft edit preserves published snapshot and nullable price');
+await admin('content/items/'+p.id,'PUT',{data:draft,action:'publish',version:2},409);ok('Optimistic locking rejects stale edits');
+await admin('content/items/'+p.id,'PUT',{data:draft,action:'publish',version:3});assert.equal((await req('/api/menu')).data.items.find(x=>x.id===p.id).price,123456);ok('Explicit prices publish only when configured');
+await admin('content/categories/'+c.id,'DELETE',{version:2},409);ok('Nonempty category deletion is prevented');
+await admin('content/categories/'+c.id,'PUT',{data:category,action:'hide',version:2});assert(!(await req('/api/menu')).data.items.some(x=>x.id===p.id));assert.equal((await req('/item/'+product.slug)).r.status,404);ok('Hidden parent categories also hide product API and pages');
+await admin('content/categories/'+c.id,'PUT',{data:category,action:'publish',version:3});
+const invalidFile=new FormData();invalidFile.append('file',new Blob(['<svg onload="alert(1)"></svg>'],{type:'image/svg+xml'}),'evil.svg');assert.equal((await req('/api/admin/media','POST',invalidFile)).r.status,400);ok('Executable image formats rejected');
+const file=new FormData();file.append('file',new Blob([readFileSync('public/static/images/fire.webp')],{type:'image/webp'}),'qa.webp');file.append('alt','تصویر آزمایشی');const media=await admin('media','POST',file,201);assert.equal((await req(media.url,'GET',undefined,{auth:false})).r.status,404);ok('R2 upload persists; unpublished media stays private');
+const withImage={...draft,imageUrl:media.url,imageAlt:'تصویر آزمایشی'};await admin('content/items/'+p.id,'PUT',{data:withImage,action:'publish',version:4});assert.equal((await req(media.url,'GET',undefined,{auth:false})).r.status,200);await admin('media/'+media.id,'DELETE',undefined,409);ok('Published media delivery and safe deletion guard');
+await admin('media/'+media.id,'PUT',{alt:'متن جایگزین جدید'});assert.equal((await admin('content')).media.find(x=>x.id===media.id).alt,'متن جایگزین جدید');ok('Media metadata editing persists');
+await admin('content/items/'+p.id,'PUT',{data:withImage,action:'hide',version:5});assert(!(await req('/api/menu')).data.items.some(x=>x.id===p.id));ok('Unpublish removes item from public endpoints');
+content=await admin('content');const firstTwo=content.items.filter(x=>x.categoryId==='burgers').slice(0,2),[a,b]=firstTwo;
+await admin('reorder/items','POST',{id:a.id,targetId:b.id,version:a.version,targetVersion:b.version});let moved=await admin('content');assert.equal(moved.items.find(x=>x.id===a.id).sortOrder,b.sortOrder);assert.equal(moved.items.find(x=>x.id===b.id).sortOrder,a.sortOrder);await admin('reorder/items','POST',{id:a.id,targetId:b.id,version:a.version,targetVersion:b.version},409);await admin('reorder/items','POST',{id:a.id,targetId:b.id,version:a.version+1,targetVersion:b.version+1});ok('Atomic accessible reordering and stale reorder protection');
+const settings=(await admin('content')).settings;await admin('content/settings/1','PUT',{data:{...settings,heroTitle:'عنوان منتشرنشده'},action:'draft',version:settings.version});assert.equal((await req('/api/menu')).data.settings.heroTitle,settings.heroTitle);await admin('content/settings/1','PUT',{data:settings,action:'publish',version:settings.version+1});ok('Settings draft and publication workflow');
+await admin('content/items/'+p.id,'DELETE',{version:6});await admin('content/categories/'+c.id,'DELETE',{version:4});await admin('media/'+media.id,'DELETE');assert.equal((await req(media.url,'GET',undefined,{auth:false})).r.status,404);ok('Item, empty category and unused media deletion');
+assert.equal((await req('/api/menu')).data.items.length,44);ok('All test menu mutations cleaned up');
+const exported=await admin('export');assert.equal(exported.items.length,44);assert(!JSON.stringify(exported).includes('password_hash'));ok('Content export excludes authentication secrets');
+await admin('logout','POST',{});assert.equal((await req('/api/admin/content')).r.status,401);ok('Logout revokes server-side session');
+writeFileSync('artifacts/api-results.json',JSON.stringify({passed:count,date:new Date().toISOString()},null,2));console.log(`${count} API acceptance checks passed.`);
